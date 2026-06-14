@@ -1,0 +1,550 @@
+name: PR Validation Workflow
+
+on:
+  pull_request:
+    branches: [dev, test, prod]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install htmlhint
+          npm install broken-link-checker
+          npm install --save-dev @types/node
+
+      - name: Run PR Description Validation
+        id: pr_description
+        run: |
+          PR_BODY="${{ github.event.pull_request.body }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          
+          if [ -z "$PR_BODY" ] || [ "$PR_BODY" = "null" ]; then
+            echo "pr_description_status=FAIL" >> $GITHUB_OUTPUT
+            echo "pr_description_msg=❌ PR description is empty" >> $GITHUB_OUTPUT
+          elif [ ${#PR_BODY} -lt 50 ]; then
+            echo "pr_description_status=WARN" >> $GITHUB_OUTPUT
+            echo "pr_description_msg=⚠️ PR description is less than 50 characters (${#PR_BODY} chars)" >> $GITHUB_OUTPUT
+          else
+            echo "pr_description_status=PASS" >> $GITHUB_OUTPUT
+            echo "pr_description_msg=✅ PR description is valid" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run HTML Validation
+        id: html_validation
+        run: |
+          cat > validate_html.js << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          
+          let htmlIssues = [];
+          
+          function validateHTMLFile(filePath) {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const issues = [];
+          
+            // Check for HTML5 DOCTYPE
+            if (!content.match(/<!DOCTYPE\s+html>/i)) {
+              issues.push("Missing DOCTYPE html5 declaration");
+            }
+          
+            // Check for html tag with lang
+            if (!content.match(/<html[^>]*lang=/i)) {
+              issues.push("Missing lang attribute on <html> tag");
+            }
+          
+            // Check for required meta tags
+            if (!content.match(/<meta\s+charset/i)) {
+              issues.push("Missing charset meta tag");
+            }
+          
+            if (!content.match(/<meta[^>]*name=["']viewport["']/i)) {
+              issues.push("Missing viewport meta tag");
+            }
+          
+            if (!content.match(/<meta[^>]*name=["']description["']/i)) {
+              issues.push("Missing description meta tag");
+            }
+          
+            if (!content.match(/<title>/i)) {
+              issues.push("Missing <title> tag");
+            }
+          
+            // Check for images without alt attributes
+            const imgMatches = content.match(/<img[^>]*>/gi) || [];
+            imgMatches.forEach((img, idx) => {
+              if (!img.match(/alt=["'][^"']*["']/i)) {
+                issues.push(`Image #${idx + 1} missing alt attribute: ${img.substring(0, 50)}...`);
+              }
+            });
+          
+            // Check for unclosed tags
+            const commonTags = ['div', 'p', 'span', 'a', 'li', 'article', 'section', 'nav'];
+            commonTags.forEach(tag => {
+              const openCount = (content.match(new RegExp(`<${tag}[^>]*>`, 'gi')) || []).length;
+              const closeCount = (content.match(new RegExp(`</${tag}>`, 'gi')) || []).length;
+              if (openCount !== closeCount) {
+                issues.push(`Mismatched <${tag}> tags: ${openCount} open, ${closeCount} closed`);
+              }
+            });
+          
+            // Check for deprecated HTML tags
+            const deprecatedTags = ['font', 'center', 'marquee', 'blink', 'u', 'strike'];
+            deprecatedTags.forEach(tag => {
+              if (content.match(new RegExp(`<${tag}[^>]*>`, 'gi'))) {
+                issues.push(`Deprecated HTML tag found: <${tag}>`);
+              }
+            });
+          
+            return issues;
+          }
+          
+          // Validate all HTML files
+          function walkDir(dir) {
+            const files = fs.readdirSync(dir);
+            files.forEach(file => {
+              const filePath = path.join(dir, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory() && !file.startsWith('.')) {
+                walkDir(filePath);
+              } else if (file.endsWith('.html')) {
+                const issues = validateHTMLFile(filePath);
+                if (issues.length > 0) {
+                  htmlIssues.push({ file: filePath, issues });
+                }
+              }
+            });
+          }
+          
+          walkDir('.');
+          
+          if (htmlIssues.length === 0) {
+            console.log("::notice::✅ HTML validation passed - all files have correct structure");
+            process.exit(0);
+          } else {
+            let message = "❌ HTML validation failed:\n";
+            htmlIssues.forEach(({file, issues}) => {
+              message += `\n**${file}:**\n`;
+              issues.forEach(issue => message += `  - ${issue}\n`);
+            });
+            console.log(message);
+            process.exit(1);
+          }
+          EOF
+          
+          node validate_html.js
+          echo "html_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Run Code Quality Check
+        id: code_quality
+        continue-on-error: true
+        run: |
+          cat > check_quality.js << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          
+          let issues = [];
+          
+          function checkFile(filePath, content) {
+            const fileIssues = [];
+            const fileName = path.basename(filePath);
+          
+            // Check for inline styles
+            const inlineStyles = content.match(/style=["'][^"']*["']/gi) || [];
+            if (inlineStyles.length > 0) {
+              fileIssues.push(`${inlineStyles.length} inline style attribute(s) found`);
+            }
+          
+            // Check for console.log in JS
+            if (fileName.endsWith('.js') || fileName.endsWith('.html')) {
+              const consoleLogs = content.match(/console\.log\s*\(/gi) || [];
+              if (consoleLogs.length > 0) {
+                fileIssues.push(`${consoleLogs.length} console.log statement(s) found`);
+              }
+            }
+          
+            return fileIssues;
+          }
+          
+          function walkDir(dir) {
+            const files = fs.readdirSync(dir);
+            files.forEach(file => {
+              const filePath = path.join(dir, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory() && !file.startsWith('.')) {
+                walkDir(filePath);
+              } else if (file.endsWith('.html') || file.endsWith('.js')) {
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const fileIssues = checkFile(filePath, content);
+                if (fileIssues.length > 0) {
+                  issues.push({ file: filePath, issues: fileIssues });
+                }
+              }
+            });
+          }
+          
+          walkDir('.');
+          
+          if (issues.length === 0) {
+            console.log("::notice::✅ Code quality check passed");
+            process.exit(0);
+          } else {
+            let message = "⚠️ Code quality issues found:\n";
+            issues.forEach(({file, issues: fileIssues}) => {
+              message += `\n**${file}:**\n`;
+              fileIssues.forEach(issue => message += `  - ${issue}\n`);
+            });
+            console.log(message);
+            process.exit(1);
+          }
+          EOF
+          
+          node check_quality.js
+
+      - name: Run Link Validation
+        id: link_validation
+        continue-on-error: true
+        run: |
+          cat > validate_links.js << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const https = require('https');
+          const http = require('http');
+          
+          let issues = [];
+          const cache = {};
+          
+          function isInternalLink(url) {
+            return !url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//');
+          }
+          
+          function isAnchorLink(url) {
+            return url.startsWith('#');
+          }
+          
+          function extractDomain(url) {
+            try {
+              return new URL(url).hostname;
+            } catch {
+              return null;
+            }
+          }
+          
+          async function checkExternalLink(url) {
+            if (cache[url]) return cache[url];
+          
+            return new Promise((resolve) => {
+              const protocol = url.startsWith('https') ? https : http;
+              const req = protocol.head(url, { timeout: 5000, maxRedirects: 2 }, (res) => {
+                cache[url] = res.statusCode < 400;
+                resolve(cache[url]);
+              });
+              req.on('error', () => {
+                cache[url] = false;
+                resolve(false);
+              });
+              req.on('timeout', () => {
+                cache[url] = false;
+                req.destroy();
+                resolve(false);
+              });
+            });
+          }
+          
+          function validateHtmlFile(filePath) {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const fileIssues = [];
+          
+            // Extract all links
+            const hrefMatches = content.match(/href=["']([^"']+)["']/gi) || [];
+            const srcMatches = content.match(/src=["']([^"']+)["']/gi) || [];
+            
+            [...hrefMatches, ...srcMatches].forEach(match => {
+              let url = match.replace(/^(?:href|src)=["']|["']$/g, '');
+              
+              if (isAnchorLink(url)) return;
+              
+              if (isInternalLink(url)) {
+                // Check if file exists
+                const resolvedPath = path.resolve(path.dirname(filePath), url);
+                if (!fs.existsSync(resolvedPath)) {
+                  fileIssues.push(`Broken internal link: ${url}`);
+                }
+              } else if (url.startsWith('http://') || url.startsWith('https://')) {
+                // External links will be checked asynchronously
+              }
+            });
+          
+            return fileIssues;
+          }
+          
+          function walkDir(dir) {
+            const files = fs.readdirSync(dir);
+            files.forEach(file => {
+              const filePath = path.join(dir, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory() && !file.startsWith('.')) {
+                walkDir(filePath);
+              } else if (file.endsWith('.html')) {
+                const fileIssues = validateHtmlFile(filePath);
+                if (fileIssues.length > 0) {
+                  issues.push({ file: filePath, issues: fileIssues });
+                }
+              }
+            });
+          }
+          
+          walkDir('.');
+          
+          if (issues.length === 0) {
+            console.log("::notice::✅ Link validation passed - all internal links are valid");
+            process.exit(0);
+          } else {
+            let message = "⚠️ Link validation issues found:\n";
+            issues.forEach(({file, issues: fileIssues}) => {
+              message += `\n**${file}:**\n`;
+              fileIssues.forEach(issue => message += `  - ${issue}\n`);
+            });
+            console.log(message);
+            process.exit(1);
+          }
+          EOF
+          
+          node validate_links.js
+
+      - name: Check File Sizes
+        id: file_size
+        continue-on-error: true
+        run: |
+          cat > check_sizes.js << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          
+          const SIZE_LIMIT = 500 * 1024; // 500KB
+          const REPO_LIMIT = 5 * 1024 * 1024; // 5MB
+          
+          let largeFiles = [];
+          let totalSize = 0;
+          
+          function walkDir(dir) {
+            const files = fs.readdirSync(dir);
+            files.forEach(file => {
+              const filePath = path.join(dir, file);
+              const stat = fs.statSync(filePath);
+              if (stat.isDirectory() && !file.startsWith('.')) {
+                walkDir(filePath);
+              } else if (stat.isFile()) {
+                totalSize += stat.size;
+                if (stat.size > SIZE_LIMIT) {
+                  largeFiles.push({
+                    file: filePath,
+                    size: (stat.size / 1024).toFixed(2)
+                  });
+                }
+              }
+            });
+          }
+          
+          walkDir('.');
+          
+          let warnings = [];
+          
+          if (largeFiles.length > 0) {
+            let msg = "⚠️ Files exceed 500KB:\n";
+            largeFiles.forEach(({file, size}) => {
+              msg += `  - ${file}: ${size}KB\n`;
+            });
+            warnings.push(msg);
+          }
+          
+          if (totalSize > REPO_LIMIT) {
+            warnings.push(`⚠️ Repository size (${(totalSize / 1024 / 1024).toFixed(2)}MB) exceeds 5MB limit`);
+          }
+          
+          if (warnings.length === 0) {
+            console.log("::notice::✅ File size check passed");
+            process.exit(0);
+          } else {
+            console.log(warnings.join("\n"));
+            process.exit(0);
+          }
+          EOF
+          
+          node check_sizes.js
+
+      - name: Create Validation Summary
+        id: summary
+        if: always()
+        run: |
+          # Determine statuses
+          HTML_STATUS="${{ job.steps.html_validation.outcome }}"
+          QUALITY_STATUS="${{ job.steps.code_quality.outcome }}"
+          LINK_STATUS="${{ job.steps.link_validation.outcome }}"
+          SIZE_STATUS="${{ job.steps.file_size.outcome }}"
+          PR_DESC_STATUS="${{ steps.pr_description.outputs.pr_description_status }}"
+          
+          # Build summary
+          SUMMARY="## 🔍 PR Validation Results\n"
+          SUMMARY="${SUMMARY}\n### Summary\n"
+          
+          if [ "$HTML_STATUS" = "success" ]; then
+            SUMMARY="${SUMMARY}✅ **HTML Validation**: PASS\n"
+          else
+            SUMMARY="${SUMMARY}❌ **HTML Validation**: FAIL\n"
+          fi
+          
+          if [ "$PR_DESC_STATUS" = "PASS" ]; then
+            SUMMARY="${SUMMARY}✅ **PR Description**: PASS\n"
+          elif [ "$PR_DESC_STATUS" = "WARN" ]; then
+            SUMMARY="${SUMMARY}⚠️ **PR Description**: WARN - ${{ steps.pr_description.outputs.pr_description_msg }}\n"
+          else
+            SUMMARY="${SUMMARY}❌ **PR Description**: FAIL - ${{ steps.pr_description.outputs.pr_description_msg }}\n"
+          fi
+          
+          if [ "$QUALITY_STATUS" = "success" ]; then
+            SUMMARY="${SUMMARY}✅ **Code Quality**: PASS\n"
+          else
+            SUMMARY="${SUMMARY}⚠️ **Code Quality**: ISSUES FOUND\n"
+          fi
+          
+          if [ "$LINK_STATUS" = "success" ]; then
+            SUMMARY="${SUMMARY}✅ **Link Validation**: PASS\n"
+          else
+            SUMMARY="${SUMMARY}⚠️ **Link Validation**: ISSUES FOUND\n"
+          fi
+          
+          if [ "$SIZE_STATUS" = "success" ]; then
+            SUMMARY="${SUMMARY}✅ **File Size Check**: PASS\n"
+          else
+            SUMMARY="${SUMMARY}⚠️ **File Size Check**: WARNINGS\n"
+          fi
+          
+          echo "SUMMARY<<EOF" >> $GITHUB_ENV
+          echo -e "$SUMMARY" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post Comment to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read validation results
+            const htmlStep = context.job.steps.find(s => s.name === 'Run HTML Validation');
+            const qualityStep = context.job.steps.find(s => s.name === 'Run Code Quality Check');
+            const linkStep = context.job.steps.find(s => s.name === 'Run Link Validation');
+            const sizeStep = context.job.steps.find(s => s.name === 'Check File Sizes');
+            const prDescStep = context.job.steps.find(s => s.name === 'Run PR Description Validation');
+            
+            let comment = `# 🔍 PR Validation Report\n\n`;
+            comment += `**Branch Target:** \`${{ github.base_ref }}\`\n`;
+            comment += `**Triggered by:** @${{ github.actor }}\n\n`;
+            
+            comment += `## Check Results\n\n`;
+            
+            // PR Description
+            const prDescStatus = '${{ steps.pr_description.outputs.pr_description_status }}';
+            if (prDescStatus === 'FAIL') {
+              comment += `❌ **PR Description**: FAILED\n`;
+              comment += `   - ${{ steps.pr_description.outputs.pr_description_msg }}\n\n`;
+            } else if (prDescStatus === 'WARN') {
+              comment += `⚠️ **PR Description**: WARNING\n`;
+              comment += `   - ${{ steps.pr_description.outputs.pr_description_msg }}\n\n`;
+            } else {
+              comment += `✅ **PR Description**: PASSED\n\n`;
+            }
+            
+            // HTML Validation
+            const htmlOutcome = '${{ job.steps.html_validation.outcome }}';
+            comment += `${htmlOutcome === 'success' ? '✅' : '❌'} **HTML Validation**: ${htmlOutcome === 'success' ? 'PASSED' : 'FAILED'}\n`;
+            if (htmlOutcome !== 'success') {
+              comment += `   - See workflow logs for details\n`;
+            }
+            comment += `\n`;
+            
+            // Code Quality
+            const qualityOutcome = '${{ job.steps.code_quality.outcome }}';
+            comment += `${qualityOutcome === 'success' ? '✅' : '⚠️'} **Code Quality**: ${qualityOutcome === 'success' ? 'PASSED' : 'ISSUES FOUND'}\n`;
+            if (qualityOutcome !== 'success') {
+              comment += `   - Check for inline styles, console.log statements, or deprecated tags\n`;
+            }
+            comment += `\n`;
+            
+            // Link Validation
+            const linkOutcome = '${{ job.steps.link_validation.outcome }}';
+            comment += `${linkOutcome === 'success' ? '✅' : '⚠️'} **Link Validation**: ${linkOutcome === 'success' ? 'PASSED' : 'ISSUES FOUND'}\n`;
+            if (linkOutcome !== 'success') {
+              comment += `   - Check for broken internal links\n`;
+            }
+            comment += `\n`;
+            
+            // File Sizes
+            const sizeOutcome = '${{ job.steps.file_size.outcome }}';
+            comment += `${sizeOutcome === 'success' ? '✅' : '⚠️'} **File Size Check**: ${sizeOutcome === 'success' ? 'PASSED' : 'WARNINGS'}\n`;
+            if (sizeOutcome !== 'success') {
+              comment += `   - Review file sizes in workflow logs\n`;
+            }
+            comment += `\n`;
+            
+            comment += `---\n\n`;
+            comment += `### Next Steps\n`;
+            if ('${{ github.base_ref }}' === 'prod') {
+              comment += `- This PR targets **prod**. Ensure:\n`;
+              comment += `  - ✅ All checks pass\n`;
+              comment += `  - ✅ Code has been tested on **test** branch\n`;
+              comment += `  - ✅ At least one approval is obtained\n\n`;
+            } else if ('${{ github.base_ref }}' === 'test') {
+              comment += `- This PR targets **test**. Ensure:\n`;
+              comment += `  - ✅ All checks pass before merging\n\n`;
+            }
+            
+            comment += `**Run #:** ${{ github.run_id }}\n`;
+            comment += `**Timestamp:** ${new Date().toISOString()}\n`;
+            
+            // Post or update comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('PR Validation Report')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment,
+              });
+              console.log('Updated existing comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+              console.log('Created new comment');
+            }
+
+      - name: Fail workflow if critical checks failed
+        if: failure() && (steps.pr_description.outputs.pr_description_status == 'FAIL' || job.steps.html_validation.outcome == 'failure')
+        run: |
+          echo "Critical validation checks failed"
+          exit 1
